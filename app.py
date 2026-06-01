@@ -3,7 +3,7 @@ from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
-    Configuration, ApiClient, MessagingApi,
+    Configuration, ApiClient, MessagingApi, MessagingApiBlob,
     ReplyMessageRequest, TextMessage
 )
 from linebot.v3.webhooks import (
@@ -26,9 +26,8 @@ configuration = Configuration(access_token=LINE_TOKEN)
 handler       = WebhookHandler(LINE_SECRET)
 
 genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+model = genai.GenerativeModel("gemini-2.0-flash-exp")
 
-# ── Google Sheets 連線 ──────────────────────────────
 def get_sheets():
     creds_data = json.loads(SERVICE_ACCOUNT)
     creds = Credentials.from_service_account_info(
@@ -39,12 +38,9 @@ def get_sheets():
     gc = gspread.authorize(creds)
     return gc.open_by_key(SHEET_ID)
 
-# ── Gemini 文字分類 ─────────────────────────────────
 CLASSIFY_PROMPT = """你是山富旅遊的業務助理。
 業務會把從LINE或Email收到的旅客資訊貼給你，請分析並回傳JSON。
-
 分類：passport/payment/dietary/room/change/flight/missing/other
-
 只回傳JSON，不要其他文字：
 {
   "type": "分類",
@@ -53,7 +49,6 @@ CLASSIFY_PROMPT = """你是山富旅遊的業務助理。
   "summary": "一行中文摘要",
   "action": "要更新哪個分頁"
 }
-
 護照欄位：passport_no, expiry, birthday, id_no, name_en
 付款欄位：deposit_amount, deposit_date, deposit_method, balance_amount, last5digits
 餐食欄位：no_beef, no_raw, vegetarian, no_seafood, other_dietary
@@ -86,7 +81,6 @@ def classify_image(image_b64):
     raw = re.sub(r"^```json\s*|\s*```$", "", raw, flags=re.MULTILINE)
     return json.loads(raw)
 
-# ── 更新 Google Sheet ───────────────────────────────
 COL_MAP = {
     "team":1,"no":2,"name_zh":3,"name_en":4,"group":5,
     "passport_no":6,"expiry":7,"passport_status":8,
@@ -192,7 +186,6 @@ def process(result):
     except Exception as e:
         return f"⚠️ 寫入錯誤：{str(e)[:80]}\n請稍後再試。"
 
-# ── Webhook ─────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook():
     sig  = request.headers.get("X-Line-Signature","")
@@ -229,9 +222,9 @@ def handle_text(event):
 def handle_image(event):
     try:
         with ApiClient(configuration) as api_client:
-            bot     = MessagingApi(api_client)
-            content = bot.get_message_content(event.message.id)
-            img_b64 = base64.b64encode(b"".join(content)).decode()
+            blob_api = MessagingApiBlob(api_client)
+            img_bytes = blob_api.get_message_content(event.message.id)
+            img_b64 = base64.b64encode(img_bytes).decode()
 
         ocr = classify_image(img_b64)
 
