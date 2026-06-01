@@ -9,7 +9,8 @@ from linebot.v3.messaging import (
 from linebot.v3.webhooks import (
     MessageEvent, TextMessageContent, ImageMessageContent
 )
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
@@ -25,8 +26,7 @@ SERVICE_ACCOUNT = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 configuration = Configuration(access_token=LINE_TOKEN)
 handler       = WebhookHandler(LINE_SECRET)
 
-genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash-latest")
+gemini = genai.Client(api_key=GEMINI_KEY)
 
 def get_sheets():
     creds_data = json.loads(SERVICE_ACCOUNT)
@@ -55,7 +55,10 @@ CLASSIFY_PROMPT = """你是山富旅遊的業務助理。
 班機欄位：flight_no, departure, arrival, dep_time, arr_time"""
 
 def classify_text(text):
-    resp = model.generate_content(f"{CLASSIFY_PROMPT}\n\n旅客資訊：\n{text}")
+    resp = gemini.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=f"{CLASSIFY_PROMPT}\n\n旅客資訊：\n{text}"
+    )
     raw  = resp.text.strip()
     raw  = re.sub(r"^```json\s*|\s*```$", "", raw, flags=re.MULTILINE)
     return json.loads(raw)
@@ -73,10 +76,14 @@ def classify_image(image_b64):
   "id_no": "身分證號（如有）",
   "confidence": "high/medium/low"
 }"""
-    resp = model.generate_content([
-        prompt,
-        {"mime_type": "image/jpeg", "data": image_b64}
-    ])
+    img_part = types.Part.from_bytes(
+        data=base64.b64decode(image_b64),
+        mime_type="image/jpeg"
+    )
+    resp = gemini.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=[prompt, img_part]
+    )
     raw = resp.text.strip()
     raw = re.sub(r"^```json\s*|\s*```$", "", raw, flags=re.MULTILINE)
     return json.loads(raw)
