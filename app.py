@@ -26,7 +26,7 @@ configuration = Configuration(access_token=LINE_TOKEN)
 handler       = WebhookHandler(LINE_SECRET)
 
 genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel("gemini-2.0-flash-exp")
+model = genai.GenerativeModel("gemini-1.5-flash-latest")
 
 def get_sheets():
     creds_data = json.loads(SERVICE_ACCOUNT)
