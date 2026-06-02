@@ -88,6 +88,8 @@ def is_query(text):
     return any(k in text for k in ["查","缺件","誰沒","未付款","誰缺","狀況","清單","名單"])
 
 def looks_like_data(text):
+    if "吃牛" in text and "不吃牛" not in text and not any(k in text for k in ["護照","匯款","訂金","尾款","房"]):
+        return False
     return any(k in text for k in [
         "護照","台胞","效期","匯款","訂金","尾款","刷卡","付款","後五碼",
         "不吃","素食","忌口","過敏","餐食","單人房","雙人房","三人房",
@@ -97,6 +99,39 @@ def looks_like_data(text):
 def has_explicit_team(text):
     text = text.strip()
     return bool(re.match(r"^(這是)?[一-鿿A-Za-z0-9月年月\s_-]{2,20}\s+[一-鿿]{2,4}", text))
+
+def is_team_setup(text):
+    return bool(re.match(r"^(這是|新增一團|新增團別|新案件|開一團)\s*[一-鿿A-Za-z0-9月年月\s_-]{2,20}$", text.strip()))
+
+def extract_team_setup(text):
+    return re.sub(r"^(這是|新增一團|新增團別|新案件|開一團)\s*", "", text).strip(" ：:-—－")
+
+def chat_answer(text, memory):
+    team_hint = f"目前團別：{memory.get('team')}" if memory.get("team") else "目前沒有指定團別"
+    prompt = f"""你是 Darren 的山富旅遊團務 AI 助理。
+你的工作：
+- 可以正常聊天、回答問題、解釋你能做什麼。
+- 如果使用者是在問團務資料，提醒他可用：查姓名、缺件、團名狀況。
+- 如果使用者是在貼旅客資料，提醒他用「團別 姓名 資料」格式會更準。
+- 不要假裝已經寫入資料，除非系統分類流程有處理。
+
+{team_hint}
+使用者訊息：{text}
+"""
+    try:
+        resp = gemini.models.generate_content(model="gemini-2.0-flash", contents=prompt)
+        return resp.text.strip()[:1800]
+    except Exception as e:
+        return (
+            "我現在不是沒智慧，是 AI 模型呼叫失敗，所以只能跑備用規則。\n"
+            f"錯誤：{str(e)[:120]}\n\n"
+            "可以先用這些不靠 AI 的指令：\n"
+            "• 查陳文賓\n"
+            "• 缺件\n"
+            "• 九月正風狀況\n"
+            "• 這是九月正風\n"
+            "• 九月正風 陳文賓不吃牛"
+        )
 
 def handle_query(text, book, memory):
     import re
@@ -473,8 +508,8 @@ def handle_text(event):
             save_memory(get_sheets(), user_id, "", "")
             reply = "🗑️ 記憶已清除"
         except: reply = "⚠️ 清除失敗"
-    elif text.startswith("這是") and len(text) <= 30 and not looks_like_data(text):
-        team = re.sub(r"^這是|的旅客|的資料|團別|團|案子", "", text).strip(" ：:-—－")
+    elif is_team_setup(text) and not looks_like_data(text):
+        team = extract_team_setup(text)
         try:
             save_memory(get_sheets(), user_id, team, "手動設定團別")
             reply = f"📝 已記住目前團別：{team}\n之後貼資料沒寫團名時，會先歸到這一團。"
@@ -489,6 +524,8 @@ def handle_text(event):
             if is_query(text):
                 q_result = handle_query(text, book, memory)
                 reply = q_result if q_result else process(classify_text(text, memory), user_id, book)
+            elif not looks_like_data(text):
+                reply = chat_answer(text, memory)
             else:
                 result = classify_text(text, memory)
                 reply = process(result, user_id, book)
