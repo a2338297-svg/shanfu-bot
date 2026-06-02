@@ -94,6 +94,10 @@ def looks_like_data(text):
         "取消","退出","不去了","不去","JOIN","join","加入","新增","改",
     ])
 
+def has_explicit_team(text):
+    text = text.strip()
+    return bool(re.match(r"^(這是)?[一-鿿A-Za-z0-9月年月\s_-]{2,20}\s+[一-鿿]{2,4}", text))
+
 def handle_query(text, book, memory):
     import re
     if text.startswith("查") and len(text) < 12:
@@ -244,6 +248,31 @@ def keyword_classify(text, memory):
         summary += "｜未抓到姓名"
     return {"type": rtype, "team": team, "passengers": passengers, "summary": summary, "action": ""}
 
+def normalize_ai_result(text, memory, result):
+    """用明確文字線索校正 AI 結果，避免舊記憶或模型誤判覆蓋當下輸入。"""
+    guard = keyword_classify(text, memory)
+
+    if guard.get("type") != "other" and result.get("type") == "other":
+        return guard
+
+    simple_keywords = ["不吃", "素食", "匯款", "訂金", "尾款", "後五碼", "單人房", "雙人房", "三人房"]
+    if guard.get("type") != "other" and any(k in text for k in simple_keywords):
+        return guard
+
+    if guard.get("team") and has_explicit_team(text):
+        result["team"] = guard["team"]
+
+    guard_names = [p.get("name") for p in guard.get("passengers", []) if p.get("name")]
+    result_names = [p.get("name") for p in result.get("passengers", []) if p.get("name")]
+    team = str(result.get("team") or guard.get("team") or "")
+    bad_result_names = any(name and name in team for name in result_names)
+    if guard_names and (not result_names or bad_result_names):
+        result["passengers"] = guard["passengers"]
+        if guard.get("type") != "other":
+            result["type"] = guard["type"]
+            result["summary"] = guard.get("summary", result.get("summary", "已收到"))
+    return result
+
 def classify_text(text, memory):
     hint = ""
     if memory.get("team"): hint += f"\n【記憶-團別】{memory['team']}"
@@ -255,7 +284,7 @@ def classify_text(text, memory):
         )
         raw = resp.text.strip()
         raw = re.sub(r"^```json\s*|\s*```$", "", raw, flags=re.MULTILINE)
-        return json.loads(raw)
+        return normalize_ai_result(text, memory, json.loads(raw))
     except Exception as e:
         if "429" in str(e) or "quota" in str(e).lower() or "RESOURCE_EXHAUSTED" in str(e):
             return keyword_classify(text, memory)
@@ -277,8 +306,15 @@ COL_LABELS = {"passport_no":"護照號碼","expiry":"護照效期","passport_sta
 
 def find_or_create_row(ws, name, team):
     name_col = ws.col_values(3)
+    team_col = ws.col_values(1)
+    if team:
+        for i, cell in enumerate(name_col[2:], start=3):
+            row_team = team_col[i - 1] if len(team_col) >= i else ""
+            if name and name in str(cell) and team in str(row_team):
+                return i
     for i, cell in enumerate(name_col[2:], start=3):
-        if name and name in str(cell): return i
+        if name and name in str(cell) and not team:
+            return i
     for i, cell in enumerate(name_col[2:], start=3):
         if not cell: return i
     return len(name_col) + 1
