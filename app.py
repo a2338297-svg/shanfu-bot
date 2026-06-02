@@ -77,17 +77,35 @@ CLASSIFY_PROMPT = """你是山富旅遊的業務助理。
 餐食欄位：no_beef, no_raw, vegetarian, no_seafood, other_dietary
 改動欄位：before, after, impact"""
 
+def keyword_classify(text, memory):
+    """Gemini 超額時的備用關鍵字分類"""
+    t = text
+    rtype = "other"
+    if any(k in t for k in ["護照","台胞","PASSPORT","passport","效期","號碼"]): rtype = "passport"
+    elif any(k in t for k in ["匯款","訂金","尾款","刷卡","後五碼","付款"]): rtype = "payment"
+    elif any(k in t for k in ["不吃","素食","忌口","過敏","餐食"]): rtype = "dietary"
+    elif any(k in t for k in ["取消","退出","改","更換","變更"]): rtype = "change"
+    team = memory.get("team","") or None
+    import re as _re
+    names = _re.findall(r'[一-鿿]{2,4}(?=s|護照|台胞|匯款|不吃|取消)', t)
+    return {"type":rtype,"team":team,"passengers":[{"name":n,"data":{}} for n in names] if names else [],"summary":f"(備用分類) {rtype}","action":""}
+
 def classify_text(text, memory):
     hint = ""
     if memory.get("team"): hint += f"\n【記憶-團別】{memory['team']}"
     if memory.get("context"): hint += f"\n【記憶-上文】{memory['context']}"
-    resp = gemini.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=f"{CLASSIFY_PROMPT}{hint}\n\n旅客資訊：\n{text}"
-    )
-    raw = resp.text.strip()
-    raw = re.sub(r"^```json\s*|\s*```$", "", raw, flags=re.MULTILINE)
-    return json.loads(raw)
+    try:
+        resp = gemini.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=f"{CLASSIFY_PROMPT}{hint}\n\n旅客資訊：\n{text}"
+        )
+        raw = resp.text.strip()
+        raw = re.sub(r"^```json\s*|\s*```$", "", raw, flags=re.MULTILINE)
+        return json.loads(raw)
+    except Exception as e:
+        if "429" in str(e) or "quota" in str(e).lower() or "RESOURCE_EXHAUSTED" in str(e):
+            return keyword_classify(text, memory)
+        raise
 
 def classify_image(image_b64):
     prompt = """這是旅客傳來的文件圖片。只回傳JSON：
@@ -213,7 +231,18 @@ def handle_text(event):
     text = event.message.text.strip()
     user_id = event.source.user_id
     if text in ["狀態","status"]:
-        reply = "📊 系統正常運作中\n請貼上旅客資料，Bot 會自動判斷類型和團別。\n\n指令：\n• 記憶 — 查看目前記憶\n• 清除記憶 — 重置上下文"
+        reply = "📊 系統正常運作中\n請貼上旅客資料，Bot 會自動判斷類型和團別。\n\n指令：\n• 記憶 — 查看目前記憶\n• 清除記憶 — 重置上下文\n• 測試Sheet — 測試Google Sheet連線"
+    elif text == "測試Sheet":
+        try:
+            book = get_sheets()
+            ws = book.worksheet("👥 旅客總表")
+            test_row = find_or_create_row(ws, "測試用戶_請刪除", "測試")
+            ws.update_cell(test_row, 1, "測試團")
+            ws.update_cell(test_row, 3, "測試用戶_請刪除")
+            ws.update_cell(test_row, 21, datetime.now().strftime("%Y/%m/%d %H:%M"))
+            reply = f"✅ Google Sheet 連線正常！\n已在旅客總表第{test_row}行寫入測試資料\n（請手動刪除那行）\n\n整套系統正常運作 🎉"
+        except Exception as e:
+            reply = f"❌ Google Sheet 連線失敗：{str(e)[:100]}"
     elif text == "記憶":
         try:
             book = get_sheets()
