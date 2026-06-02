@@ -173,6 +173,123 @@ def save_memory(book, user_id, team, context):
             ws.append_row([user_id, team, context, now])
     except Exception as e: print(f"Memory error: {e}")
 
+def now_text():
+    return datetime.now().strftime("%Y/%m/%d %H:%M")
+
+def get_or_create_ws(book, title, headers, rows=1000, cols=12):
+    try:
+        return book.worksheet(title)
+    except Exception:
+        ws = book.add_worksheet(title, rows=rows, cols=cols)
+        ws.append_row(headers)
+        return ws
+
+def names_text(result):
+    names = [p.get("name", "") for p in result.get("passengers", []) if p.get("name")]
+    return "、".join(names)
+
+def result_json(result):
+    return json.dumps(result, ensure_ascii=False)
+
+def missing_fields_for_result(result):
+    rtype = result.get("type", "other")
+    team = result.get("team")
+    passengers = result.get("passengers", []) or []
+    missing = []
+    if rtype != "other" and not team:
+        missing.append("團別")
+    if rtype != "other" and not passengers:
+        missing.append("姓名/對象")
+    required = {
+        "passport": [("passport_no", "護照號碼"), ("expiry", "護照效期")],
+        "payment": [("deposit_amount|balance_amount", "付款金額"), ("deposit_method|last5digits", "付款方式/後五碼")],
+        "dietary": [("no_beef|no_raw|vegetarian|no_seafood|other_dietary|dietary", "餐食內容")],
+        "room": [("room_type", "房型")],
+        "change": [("after|impact|dietary|room_type", "變動內容")],
+    }
+    for p in passengers:
+        name = p.get("name") or "未指定"
+        if name.startswith("待補") or name in ["未知", "未指定"]:
+            missing.append(f"{name}:正確姓名")
+        data = p.get("data", {}) or {}
+        for keys, label in required.get(rtype, []):
+            if not any(data.get(k) for k in keys.split("|")):
+                missing.append(f"{name}:{label}")
+    return missing
+
+def append_ai_inbox(book, user_id, source_text, result, is_data, write_status, write_tabs="", error="", needs_confirm=False):
+    ws = get_or_create_ws(
+        book,
+        "🤖 AI收件紀錄",
+        ["時間","使用者ID","原始訊息","AI判斷類型","團別","涉及人員","解析摘要","AI信心","是否資料","寫入狀態","寫入分頁","錯誤原因","是否需人工確認","AI解析JSON"],
+        cols=14,
+    )
+    ws.append_row([
+        now_text(),
+        user_id,
+        source_text,
+        result.get("type", "other"),
+        result.get("team", ""),
+        names_text(result),
+        result.get("summary", ""),
+        result.get("confidence", "medium"),
+        "是" if is_data else "否",
+        write_status,
+        write_tabs,
+        error,
+        "是" if needs_confirm else "否",
+        result_json(result),
+    ])
+
+def append_pending_confirmation(book, source_text, result, reason):
+    ws = get_or_create_ws(
+        book,
+        "✅ 待確認",
+        ["確認碼","時間","團別","姓名/對象","類型","原始訊息","AI解析結果","建議動作","狀態","確認人","確認時間","備註"],
+        cols=12,
+    )
+    confirm_id = "C" + datetime.now().strftime("%m%d%H%M%S")
+    ws.append_row([
+        confirm_id,
+        now_text(),
+        result.get("team", ""),
+        names_text(result),
+        result.get("type", "other"),
+        source_text,
+        result_json(result),
+        "補齊：" + "、".join(reason),
+        "待確認",
+        "",
+        "",
+        "",
+    ])
+    return confirm_id
+
+def append_sync_task(book, team, person, rtype, tabs, source_summary):
+    ws = get_or_create_ws(
+        book,
+        "🔁 同步任務",
+        ["時間","團別","姓名/對象","資料類型","Google Sheet狀態","本地紀錄狀態","科威狀態","待處理事項","負責人","截止時間","狀態","來源摘要"],
+        cols=12,
+    )
+    action = {
+        "passport": "確認科威證件資料同步",
+        "payment": "確認科威收款狀態同步",
+        "dietary": "通知供應商並確認特殊餐食",
+        "room": "確認房型/分房資料同步",
+        "change": "確認人員變動影響",
+    }.get(rtype, "人工確認是否需同步")
+    ws.append_row([now_text(), team, person, rtype, "已寫入：" + tabs, "未啟用", "待處理", action, "Darren", "今日", "待處理", source_summary])
+
+def append_reminder(book, team, person, task, source_text, priority="中"):
+    ws = get_or_create_ws(
+        book,
+        "🔔 提醒事項",
+        ["建立時間","團別","姓名/對象","提醒事項","來源訊息","截止時間","優先級","狀態","完成時間","備註"],
+        cols=10,
+    )
+    ws.append_row([now_text(), team, person, task, source_text, "今日", priority, "待處理", "", ""])
+
 CLASSIFY_PROMPT = """你是山富旅遊的業務助理。
 業務會把從LINE或Email收到的旅客資訊貼給你，請分析並回傳JSON。
 分類：passport/payment/dietary/room/change/flight/missing/other
@@ -385,7 +502,7 @@ def append_change(ws, team, person, before, after, impact):
 def append_payment(ws, team, name, d):
     ws.append_row([team, name, d.get("deposit_amount",""), d.get("deposit_date",""), d.get("deposit_method",""), d.get("balance_amount",""), d.get("balance_date",""), d.get("balance_method",""), d.get("last5digits",""), "⏳ 確認中", ""])
 
-def process(result, user_id, book):
+def process(result, user_id, book, source_text=""):
     try:
         passengers = result.get("passengers", [])
         team = result.get("team") or "（未指定）"
@@ -395,6 +512,24 @@ def process(result, user_id, book):
         try: ws_change = book.worksheet("✏️ 改動記錄")
         except: ws_change = None
         all_changes = []
+
+        missing_fields = missing_fields_for_result(result)
+        if rtype == "other" or missing_fields:
+            confirm_id = append_pending_confirmation(book, source_text, result, missing_fields or ["AI無法判斷是否為資料"])
+            append_ai_inbox(book, user_id, source_text, result, rtype != "other", "待確認", "", "缺資料/不明確", True)
+            save_memory(book, user_id, team, f"{rtype}: {summary}")
+            lines = [
+                f"⚠️ 這筆我先放到待確認，沒有寫入主表。",
+                f"確認碼：{confirm_id}",
+                f"判斷：{rtype}",
+                f"團別：{team}",
+            ]
+            if names_text(result):
+                lines.append(f"人員：{names_text(result)}")
+            lines.append("原因：" + "、".join(missing_fields or ["AI無法判斷是否為資料"]))
+            lines.append("存到：🤖 AI收件紀錄、✅ 待確認")
+            lines.append(f"Sheet：https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit")
+            return "\n".join(lines)
 
         if rtype == "passport":
             ws = book.worksheet("👥 旅客總表")
@@ -453,6 +588,21 @@ def process(result, user_id, book):
                     _, ch = update_passenger(ws_p, ws_change, p["name"], team, upd)
                     all_changes.extend(ch)
 
+        write_tabs = "、".join(dict.fromkeys(touched_tabs))
+        append_ai_inbox(book, user_id, source_text, result, True, "已寫入" if touched_tabs else "未寫入", write_tabs, "", False)
+        for p in passengers or [{"name": "未指定"}]:
+            person = p.get("name", "未指定")
+            if touched_tabs:
+                append_sync_task(book, team, person, rtype, write_tabs, summary)
+            if rtype == "dietary":
+                append_reminder(book, team, person, "通知供應商特殊餐食", source_text)
+            elif rtype == "payment":
+                append_reminder(book, team, person, "確認款項是否入帳", source_text)
+            elif rtype == "passport":
+                append_reminder(book, team, person, "確認護照效期與缺件狀態", source_text)
+            elif rtype == "change":
+                append_reminder(book, team, person, "確認變動是否影響房型/機票/報價", source_text, "高")
+
         save_memory(book, user_id, team, f"{rtype}: {summary}")
         lines = [f"✅ {summary}", ""]
         for p in passengers: lines.append(f"• {p.get('name','未知')} 已更新")
@@ -464,6 +614,7 @@ def process(result, user_id, book):
         lines.append(f"\n團別：{team}")
         if touched_tabs:
             lines.append(f"存到：{'、'.join(dict.fromkeys(touched_tabs))}")
+            lines.append("已記錄：🤖 AI收件紀錄、🔁 同步任務、🔔 提醒事項")
             lines.append(f"Sheet：https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit")
         else:
             lines.append("存到：未寫入資料列（只更新記憶/分類）")
@@ -511,7 +662,9 @@ def handle_text(event):
     elif is_team_setup(text) and not looks_like_data(text):
         team = extract_team_setup(text)
         try:
-            save_memory(get_sheets(), user_id, team, "手動設定團別")
+            book = get_sheets()
+            save_memory(book, user_id, team, "手動設定團別")
+            append_ai_inbox(book, user_id, text, {"type":"team_setup","team":team,"passengers":[],"summary":"手動設定團別"}, False, "已更新記憶", "💬 對話記憶", "", False)
             reply = f"📝 已記住目前團別：{team}\n之後貼資料沒寫團名時，會先歸到這一團。"
         except Exception as e:
             reply = f"⚠️ 記憶設定失敗：{str(e)[:100]}"
@@ -523,12 +676,17 @@ def handle_text(event):
             memory = get_memory(book, user_id)
             if is_query(text):
                 q_result = handle_query(text, book, memory)
-                reply = q_result if q_result else process(classify_text(text, memory), user_id, book)
+                if q_result:
+                    append_ai_inbox(book, user_id, text, {"type":"query","team":memory.get("team",""),"passengers":[],"summary":"查詢指令"}, False, "已回答查詢", "", "", False)
+                    reply = q_result
+                else:
+                    reply = process(classify_text(text, memory), user_id, book, text)
             elif not looks_like_data(text):
                 reply = chat_answer(text, memory)
+                append_ai_inbox(book, user_id, text, {"type":"chat","team":memory.get("team",""),"passengers":[],"summary":"一般問答/聊天"}, False, "已回答聊天", "", "", False)
             else:
                 result = classify_text(text, memory)
-                reply = process(result, user_id, book)
+                reply = process(result, user_id, book, text)
         except Exception as e:
             reply = f"⚠️ 錯誤：{str(e)[:100]}"
     with ApiClient(configuration) as api_client:
