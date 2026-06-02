@@ -87,6 +87,13 @@ def query_team(book, team):
 def is_query(text):
     return any(k in text for k in ["查","缺件","誰沒","未付款","誰缺","狀況","清單","名單"])
 
+def looks_like_data(text):
+    return any(k in text for k in [
+        "護照","台胞","效期","匯款","訂金","尾款","刷卡","付款","後五碼",
+        "不吃","素食","忌口","過敏","餐食","單人房","雙人房","三人房",
+        "取消","退出","不去了","不去","JOIN","join","加入","新增","改",
+    ])
+
 def handle_query(text, book, memory):
     import re
     if text.startswith("查") and len(text) < 12:
@@ -185,7 +192,8 @@ def keyword_classify(text, memory):
         if idx >= 0:
             split_at = min(split_at, idx)
     raw_team = t[:split_at].strip(" -—－，,：:")
-    raw_team = _re.sub(r'(這是|團別|的|有|一位|一個)$', '', raw_team).strip()
+    raw_team = _re.sub(r'^(這是|團別[:：]?|這團是)', '', raw_team).strip()
+    raw_team = _re.sub(r'(的|有|一位|一個)$', '', raw_team).strip()
     team = raw_team or memory.get("team","") or None
 
     data = {}
@@ -429,7 +437,7 @@ def handle_text(event):
             save_memory(get_sheets(), user_id, "", "")
             reply = "🗑️ 記憶已清除"
         except: reply = "⚠️ 清除失敗"
-    elif text.startswith("這是") and len(text) <= 30:
+    elif text.startswith("這是") and len(text) <= 30 and not looks_like_data(text):
         team = re.sub(r"^這是|的旅客|的資料|團別|團|案子", "", text).strip(" ：:-—－")
         try:
             save_memory(get_sheets(), user_id, team, "手動設定團別")
