@@ -144,17 +144,97 @@ CLASSIFY_PROMPT = """你是山富旅遊的業務助理。
 改動欄位：before, after, impact"""
 
 def keyword_classify(text, memory):
-    """Gemini 超額時的備用關鍵字分類"""
-    t = text
+    """Gemini 超額時的備用解析。盡量抓團別、姓名與常見欄位，讓系統不中斷。"""
+    t = text.strip()
     rtype = "other"
-    if any(k in t for k in ["護照","台胞","PASSPORT","passport","效期","號碼"]): rtype = "passport"
-    elif any(k in t for k in ["匯款","訂金","尾款","刷卡","後五碼","付款"]): rtype = "payment"
-    elif any(k in t for k in ["不吃","素食","忌口","過敏","餐食"]): rtype = "dietary"
-    elif any(k in t for k in ["取消","退出","改","更換","變更"]): rtype = "change"
-    team = memory.get("team","") or None
     import re as _re
-    names = _re.findall(r'[一-鿿]{2,4}(?=s|護照|台胞|匯款|不吃|取消)', t)
-    return {"type":rtype,"team":team,"passengers":[{"name":n,"data":{}} for n in names] if names else [],"summary":f"(備用分類) {rtype}","action":""}
+
+    if any(k in t for k in ["護照","台胞","PASSPORT","passport","效期","號碼"]):
+        rtype = "passport"
+    elif any(k in t for k in ["匯款","訂金","尾款","刷卡","後五碼","付款"]):
+        rtype = "payment"
+    elif any(k in t for k in ["不吃","素食","忌口","過敏","餐食"]):
+        rtype = "dietary"
+    elif any(k in t for k in ["單人房","雙人房","三人房","兩張床","一大床","房型","膠囊"]):
+        rtype = "room"
+    elif any(k in t for k in ["取消","退出","不去了","不去","JOIN","join","加入","新增","改","更換","變更"]):
+        rtype = "change"
+
+    name_patterns = [
+        r'([一-鿿]{2,4})\s*(?=不吃|素食|忌口|過敏)',
+        r'([一-鿿]{2,4}).{0,8}(?=護照|台胞|效期|PASSPORT|passport)',
+        r'([一-鿿]{2,4}).{0,8}(?=匯款|訂金|尾款|刷卡|付款|後五碼)',
+        r'([一-鿿]{2,4}).{0,8}(?=單人房|雙人房|三人房|兩張床|一大床|房型|膠囊)',
+        r'([一-鿿]{2,4})\s*(?=取消|退出|不去了|不去)',
+        r'(?:新增|加入|JOIN|join|一位JOIN|一位join)\s*([一-鿿]{2,4})'
+    ]
+    names = []
+    for pat in name_patterns:
+        for name in _re.findall(pat, t):
+            if name and name not in names and name not in ["護照", "台胞", "訂金", "尾款"]:
+                names.append(name)
+
+    action_words = ["護照","台胞","效期","匯款","訂金","尾款","刷卡","付款","後五碼","不吃","素食","忌口","過敏","單人房","雙人房","三人房","兩張床","一大床","房型","膠囊","取消","退出","不去了","不去","JOIN","join","加入","新增","改","更換","變更"]
+    split_at = len(t)
+    for name in names:
+        idx = t.find(name)
+        if idx >= 0:
+            split_at = min(split_at, idx)
+    for word in action_words:
+        idx = t.find(word)
+        if idx >= 0:
+            split_at = min(split_at, idx)
+    raw_team = t[:split_at].strip(" -—－，,：:")
+    raw_team = _re.sub(r'(這是|團別|的|有|一位|一個)$', '', raw_team).strip()
+    team = raw_team or memory.get("team","") or None
+
+    data = {}
+    if rtype == "dietary":
+        data = {
+            "no_beef": "不吃牛" in t,
+            "no_raw": any(k in t for k in ["不吃生", "不吃生食", "不吃生魚片"]),
+            "vegetarian": "素食" in t,
+            "no_seafood": "不吃海鮮" in t,
+            "other_dietary": ""
+        }
+    elif rtype == "payment":
+        amount = _re.search(r'(訂金|尾款)?\s*([0-9,]{3,})', t)
+        last5 = _re.search(r'後五碼\s*([0-9]{3,5})', t)
+        data = {
+            "deposit_amount": amount.group(2).replace(",", "") if amount and "尾款" not in t else "",
+            "balance_amount": amount.group(2).replace(",", "") if amount and "尾款" in t else "",
+            "deposit_method": "匯款" if "匯款" in t else ("刷卡" if "刷卡" in t else ""),
+            "last5digits": last5.group(1) if last5 else ""
+        }
+    elif rtype == "passport":
+        passport_no = _re.search(r'([A-Z][0-9]{8}|[A-Z]{1,2}[0-9]{6,9})', t, _re.I)
+        expiry = _re.search(r'(20[0-9]{2})[/-年 ]?([0-9]{1,2})?[/-月 ]?([0-9]{1,2})?', t)
+        data = {
+            "passport_no": passport_no.group(1).upper() if passport_no else "",
+            "expiry": "/".join([x for x in (expiry.groups() if expiry else []) if x]) if expiry else ""
+        }
+    elif rtype == "room":
+        room = ""
+        for word in ["單人房", "雙人房", "三人房", "兩張床", "一大床", "膠囊"]:
+            if word in t:
+                room = word
+                break
+        data = {"room_type": room or "房型待確認"}
+    elif rtype == "change":
+        if any(k in t for k in ["JOIN", "join", "加入", "新增"]):
+            data = {"before": "", "after": "新增/JOIN", "impact": "新增旅客，姓名待補" if not names else "新增旅客"}
+            if not names:
+                names = ["待補姓名_JOIN"]
+        elif any(k in t for k in ["取消", "退出", "不去了", "不去"]):
+            data = {"before": "參加", "after": "取消", "impact": "需確認取消費、房型與名單"}
+
+    passengers = [{"name": n, "data": data.copy()} for n in names]
+    summary = f"(備用解析) {rtype}"
+    if team:
+        summary += f"｜團別：{team}"
+    if not passengers and rtype != "other":
+        summary += "｜未抓到姓名"
+    return {"type": rtype, "team": team, "passengers": passengers, "summary": summary, "action": ""}
 
 def classify_text(text, memory):
     hint = ""
@@ -232,21 +312,30 @@ def process(result, user_id, book):
         team = result.get("team") or "（未指定）"
         rtype = result.get("type", "other")
         summary = result.get("summary", "已收到")
+        touched_tabs = []
         try: ws_change = book.worksheet("✏️ 改動記錄")
         except: ws_change = None
         all_changes = []
 
         if rtype == "passport":
             ws = book.worksheet("👥 旅客總表")
+            touched_tabs.append("👥 旅客總表")
             for p in passengers:
                 d = p.get("data", {})
                 _, ch = update_passenger(ws, ws_change, p["name"], team, {"passport_no":d.get("passport_no",""),"expiry":d.get("expiry",""),"birthday":d.get("birthday",""),"id_no":d.get("id_no",""),"name_en":d.get("name_en",""),"passport_status":"✅ 已交"})
                 all_changes.extend(ch)
         elif rtype == "payment":
             ws = book.worksheet("💰 付款追蹤")
+            touched_tabs.append("💰 付款追蹤")
             for p in passengers: append_payment(ws, team, p["name"], p.get("data",{}))
         elif rtype == "dietary":
             ws_p = book.worksheet("👥 旅客總表")
+            touched_tabs.append("👥 旅客總表")
+            try:
+                ws_special = book.worksheet("🍽️ 特殊需求")
+                touched_tabs.append("🍽️ 特殊需求")
+            except:
+                ws_special = None
             for p in passengers:
                 d = p.get("data", {})
                 parts = []
@@ -255,10 +344,21 @@ def process(result, user_id, book):
                 if d.get("vegetarian"): parts.append("素食")
                 if d.get("no_seafood"): parts.append("不吃海鮮")
                 if d.get("other_dietary"): parts.append(d["other_dietary"])
-                _, ch = update_passenger(ws_p, ws_change, p["name"], team, {"dietary":"、".join(parts)})
+                dietary_text = "、".join(parts) or d.get("dietary", "") or "餐食需求待確認"
+                _, ch = update_passenger(ws_p, ws_change, p["name"], team, {"dietary":dietary_text})
+                all_changes.extend(ch)
+                if ws_special:
+                    ws_special.append_row([team, p["name"], "", "", "", "", "", dietary_text, "", datetime.now().strftime("%Y/%m/%d %H:%M")])
+        elif rtype == "room":
+            ws_p = book.worksheet("👥 旅客總表")
+            touched_tabs.append("👥 旅客總表")
+            for p in passengers:
+                d = p.get("data", {})
+                _, ch = update_passenger(ws_p, ws_change, p["name"], team, {"room_type":d.get("room_type", "房型待確認")})
                 all_changes.extend(ch)
         elif rtype == "change":
             if ws_change:
+                touched_tabs.append("✏️ 改動記錄")
                 for p in passengers:
                     d = p.get("data", {})
                     append_change(ws_change, team, p["name"], d.get("before",""), d.get("after",""), d.get("impact",""))
@@ -269,16 +369,25 @@ def process(result, user_id, book):
                 if d.get("room_type"): upd["room_type"] = d["room_type"]
                 if d.get("dietary"): upd["dietary"] = d["dietary"]
                 if upd:
+                    if "👥 旅客總表" not in touched_tabs:
+                        touched_tabs.append("👥 旅客總表")
                     _, ch = update_passenger(ws_p, ws_change, p["name"], team, upd)
                     all_changes.extend(ch)
 
         save_memory(book, user_id, team, f"{rtype}: {summary}")
         lines = [f"✅ {summary}", ""]
         for p in passengers: lines.append(f"• {p.get('name','未知')} 已更新")
+        if not passengers and rtype != "other":
+            lines.append("⚠️ 有判斷出資料類型，但沒有抓到姓名；請補姓名再貼一次。")
         if all_changes:
             lines.append("\n🔄 自動偵測到改動：")
             for ch in all_changes: lines.append(f"  {ch}")
         lines.append(f"\n團別：{team}")
+        if touched_tabs:
+            lines.append(f"存到：{'、'.join(dict.fromkeys(touched_tabs))}")
+            lines.append(f"Sheet：https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit")
+        else:
+            lines.append("存到：未寫入資料列（只更新記憶/分類）")
         lines.append(f"時間：{datetime.now().strftime('%H:%M')}")
         return "\n".join(lines)
     except Exception as e:
@@ -320,6 +429,13 @@ def handle_text(event):
             save_memory(get_sheets(), user_id, "", "")
             reply = "🗑️ 記憶已清除"
         except: reply = "⚠️ 清除失敗"
+    elif text.startswith("這是") and len(text) <= 30:
+        team = re.sub(r"^這是|的旅客|的資料|團別|團|案子", "", text).strip(" ：:-—－")
+        try:
+            save_memory(get_sheets(), user_id, team, "手動設定團別")
+            reply = f"📝 已記住目前團別：{team}\n之後貼資料沒寫團名時，會先歸到這一團。"
+        except Exception as e:
+            reply = f"⚠️ 記憶設定失敗：{str(e)[:100]}"
     elif len(text) < 5:
         reply = "請貼上旅客資料（護照、付款、餐食需求等），我會自動更新試算表。\n\n查詢：查[姓名] / 缺件 / [團名]狀況"
     else:
