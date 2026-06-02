@@ -35,6 +35,72 @@ def get_sheets():
     )
     return gspread.authorize(creds).open_by_key(SHEET_ID)
 
+
+# ── 查詢功能（不需要 Gemini）────────────────────────
+def query_person(book, name):
+    try:
+        ws = book.worksheet("👥 旅客總表")
+        rows = ws.get_all_values()
+        for row in rows[2:]:
+            if name in (row[2] if len(row) > 2 else ""):
+                r = [f"👤 {row[2]} {row[3] if len(row)>3 else ''}", f"團別：{row[0] or '未指定'}", f"護照：{row[7] if len(row)>7 else '未填'} {row[5] if len(row)>5 else ''}", f"效期：{row[6] if len(row)>6 else '未填'}", f"房型：{row[10] if len(row)>10 else '未填'}", f"餐食：{row[12] if len(row)>12 else '未填'}", f"訂金：{row[14] if len(row)>14 else '未填'}", f"尾款：{row[15] if len(row)>15 else '未填'}"]
+                if len(row)>20 and row[20]: r.append(f"更新：{row[20]}")
+                return "\n".join(r)
+        return f"❌ 找不到「{name}」，請確認姓名"
+    except Exception as e: return f"⚠️ 查詢失敗：{str(e)[:80]}"
+
+def query_missing(book, team=None):
+    try:
+        ws = book.worksheet("👥 旅客總表")
+        rows = ws.get_all_values()
+        missing = []
+        for row in rows[2:]:
+            if len(row) < 8: continue
+            if team and team not in str(row[0]): continue
+            name = row[2] if len(row)>2 else ""
+            if not name or "測試" in name: continue
+            issues = []
+            if not row[7] or "✅" not in row[7]: issues.append("護照未交")
+            if len(row)>14 and (not row[14] or "✅" not in row[14]): issues.append("訂金未付")
+            if len(row)>15 and (not row[15] or "✅" not in row[15]): issues.append("尾款未付")
+            if issues: missing.append(f"• {name}（{row[0] or '未指定'}）：{'、'.join(issues)}")
+        if not missing: return "✅ 所有旅客資料完整！"
+        hdr = f"⚠️ 缺件名單（{len(missing)}人）" + (f" — {team}" if team else "")
+        return hdr + "\n" + "\n".join(missing[:20])
+    except Exception as e: return f"⚠️ 查詢失敗：{str(e)[:80]}"
+
+def query_team(book, team):
+    try:
+        ws = book.worksheet("👥 旅客總表")
+        rows = ws.get_all_values()
+        total = passport_ok = deposit_ok = balance_ok = 0
+        for row in rows[2:]:
+            if len(row)<3 or team not in str(row[0]) or not row[2] or "測試" in row[2]: continue
+            total += 1
+            if len(row)>7 and "✅" in str(row[7]): passport_ok += 1
+            if len(row)>14 and "✅" in str(row[14]): deposit_ok += 1
+            if len(row)>15 and "✅" in str(row[15]): balance_ok += 1
+        if not total: return f"❌ 找不到「{team}」的資料"
+        return "\n".join([f"📋 {team} 狀況", f"總人數：{total}人", f"護照：{passport_ok}/{total}（{total-passport_ok}人未交）", f"訂金：{deposit_ok}/{total}（{total-deposit_ok}人未付）", f"尾款：{balance_ok}/{total}（{total-balance_ok}人未付）"])
+    except Exception as e: return f"⚠️ 查詢失敗：{str(e)[:80]}"
+
+def is_query(text):
+    return any(k in text for k in ["查","缺件","誰沒","未付款","誰缺","狀況","清單","名單"])
+
+def handle_query(text, book, memory):
+    import re
+    if text.startswith("查") and len(text) < 12:
+        name = re.sub(r"查|狀態|的", "", text).strip()
+        if name: return query_person(book, name)
+    if any(k in text for k in ["缺件","誰缺","誰沒交","護照缺","未付款","誰沒付"]):
+        return query_missing(book, memory.get("team") or None)
+    if "狀況" in text or "狀態" in text:
+        team = memory.get("team","")
+        cleaned = re.sub(r"狀況|狀態|整體|查詢|告訴我", "", text).strip()
+        if cleaned and len(cleaned)>1: team = cleaned
+        if team: return query_team(book, team)
+    return None
+
 def get_memory(book, user_id):
     try:
         ws = book.worksheet("💬 對話記憶")
@@ -255,13 +321,17 @@ def handle_text(event):
             reply = "🗑️ 記憶已清除"
         except: reply = "⚠️ 清除失敗"
     elif len(text) < 5:
-        reply = "請貼上旅客資料（護照、付款、餐食需求等），我會自動更新試算表。"
+        reply = "請貼上旅客資料（護照、付款、餐食需求等），我會自動更新試算表。\n\n查詢：查[姓名] / 缺件 / [團名]狀況"
     else:
         try:
             book = get_sheets()
             memory = get_memory(book, user_id)
-            result = classify_text(text, memory)
-            reply = process(result, user_id, book)
+            if is_query(text):
+                q_result = handle_query(text, book, memory)
+                reply = q_result if q_result else process(classify_text(text, memory), user_id, book)
+            else:
+                result = classify_text(text, memory)
+                reply = process(result, user_id, book)
         except Exception as e:
             reply = f"⚠️ 錯誤：{str(e)[:100]}"
     with ApiClient(configuration) as api_client:
