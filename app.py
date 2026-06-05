@@ -367,20 +367,37 @@ def keyword_classify(text, memory):
             if name and name not in names and name not in ["護照", "台胞", "訂金", "尾款"]:
                 names.append(name)
 
+    # 過濾：團名（含團/隊/梯…）與欄位標籤都不是人名
+    FIELD_WORDS = ["護照","台胞","效期","號碼","匯款","訂金","尾款","刷卡","付款","後五碼",
+        "不吃","素食","忌口","過敏","餐食","單人房","雙人房","三人房","兩張床","一大床","房型","膠囊",
+        "取消","退出","不去","加入","新增","更換","變更","生日","身分證","班機","機票"]
+    def _is_team_token(tok):
+        return tok.endswith(("團", "隊", "梯", "團體", "公司"))
+    names = [n for n in names if not _is_team_token(n) and n not in FIELD_WORDS]
+
     action_words = ["護照","台胞","效期","匯款","訂金","尾款","刷卡","付款","後五碼","不吃","素食","忌口","過敏","單人房","雙人房","三人房","兩張床","一大床","房型","膠囊","取消","退出","不去了","不去","JOIN","join","加入","新增","改","更換","變更"]
     split_at = len(t)
-    for name in names:
-        idx = t.find(name)
-        if idx >= 0:
-            split_at = min(split_at, idx)
-    for word in action_words:
+    for word in names + action_words:
         idx = t.find(word)
         if idx >= 0:
             split_at = min(split_at, idx)
     raw_team = t[:split_at].strip(" -—－，,：:")
     raw_team = _re.sub(r'^(這是|團別[:：]?|這團是)', '', raw_team).strip()
     raw_team = _re.sub(r'(的|有|一位|一個)$', '', raw_team).strip()
-    team = raw_team or memory.get("team","") or None
+
+    # 明確團名（含「團/隊」）最優先，且覆蓋舊記憶；團名後第一個中文詞多半是姓名
+    explicit_team = None
+    m_team = _re.search(r'([一-鿿A-Za-z0-9]{2,12}?(?:團|隊))', t)
+    if m_team:
+        explicit_team = m_team.group(1)
+        names = [n for n in names if n not in explicit_team]  # 去掉被誤抓的團名片段
+        after = t.split(explicit_team, 1)[-1]
+        m_name = _re.search(r'([一-鿿]{2,4})', after)
+        if m_name:
+            cand = m_name.group(1)
+            if not _is_team_token(cand) and cand not in FIELD_WORDS and cand not in names:
+                names.insert(0, cand)
+    team = explicit_team or raw_team or memory.get("team", "") or None
 
     data = {}
     if rtype == "dietary":
