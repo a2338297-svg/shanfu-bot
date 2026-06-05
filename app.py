@@ -715,8 +715,9 @@ def build_daily_digest(book):
             exp = parse_date_any(row[6] if len(row) > 6 else "")
             pstat = str(row[7] if len(row) > 7 else "")
             bal = str(row[15] if len(row) > 15 else "")
-            # 1) 護照效期不足回程+6個月
-            if exp and ret and exp < add_months(ret, 6):
+            # 1) 護照效期不足回程+6個月（只報還沒出發的團；已出發就來不及補救了）
+            departed = bool(depart and depart < today)
+            if exp and ret and not departed and exp < add_months(ret, 6):
                 expiry_alerts.append(f"• {name}（{team}）效期 {row[6]}")
             # 2) 出發前14天仍缺件
             if depart:
