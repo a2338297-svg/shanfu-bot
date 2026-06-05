@@ -1,0 +1,19 @@
+name: 每日巡守 daily-guardian
+
+# 每天 00:00 UTC = 台灣時間 08:00 自動觸發 /cron/daily
+# 也可在 GitHub Actions 頁面手動按 "Run workflow" 測試
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  trigger-daily:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 觸發山富每日巡守
+        run: |
+          echo "觸發 /cron/daily ..."
+          curl -fsS "https://web-production-28fdf8.up.railway.app/cron/daily?key=${{ secrets.CRON_KEY }}"
+          echo ""
+          echo "完成。"
