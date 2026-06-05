@@ -842,6 +842,61 @@ def cron_daily():
     except Exception as e:
         return f"error: {str(e)[:200]}", 500
 
+# ── 一次性「整理 Sheet」：建 M2 分頁、隱藏後台頁、頁籤上色 ──────────
+def _color_req(sheet_id, r, g, b):
+    return {"updateSheetProperties": {
+        "properties": {"sheetId": sheet_id, "tabColor": {"red": r, "green": g, "blue": b}},
+        "fields": "tabColor"}}
+
+@app.route("/admin/setup", methods=["GET", "POST"])
+def admin_setup():
+    """一次性整理：可重複執行（idempotent）。可選 ?key= 搭配 CRON_KEY。"""
+    expected = os.environ.get("CRON_KEY", "")
+    if expected and request.args.get("key", "") != expected:
+        abort(403)
+    try:
+        book = get_sheets()
+        done = []
+
+        # 1) 建立 M2「✈️ 外站資源控管」（不存在才建）
+        m2 = find_ws(book, "外站資源控管")
+        if not m2:
+            m2 = book.add_worksheet("✈️ 外站資源控管", rows=300, cols=13)
+            m2.append_row(["團別","資源類別(機位/飯店/餐/地接/領隊/門票)","供應商",
+                           "訂位/訂房狀態","訂金狀態","回收日","出名單日","開票期限",
+                           "確認編號(PNR/訂房號)","數量(訂)","數量(需)","回簽狀態","備註"])
+            done.append("✅ 已建立 ✈️ 外站資源控管")
+        else:
+            done.append("➖ ✈️ 外站資源控管 已存在")
+
+        reqs = []
+        # 2) 隱藏 4 個後台頁
+        for kw in ["對話記憶", "AI收件紀錄", "同步任務", "原始收件"]:
+            w = find_ws(book, kw)
+            if w:
+                reqs.append({"updateSheetProperties": {
+                    "properties": {"sheetId": w.id, "hidden": True}, "fields": "hidden"}})
+
+        # 3) 頁籤上色分組：綠=每天看 藍=M2 黃=待辦
+        green = (0.72, 0.88, 0.80)
+        blue  = (0.62, 0.77, 0.91)
+        yellow = (1.0, 0.95, 0.70)
+        for kw in ["案件總覽","旅客總表","缺件警示","付款追蹤","特殊需求","製作物進度"]:
+            w = find_ws(book, kw)
+            if w: reqs.append(_color_req(w.id, *green))
+        if m2: reqs.append(_color_req(m2.id, *blue))
+        for kw in ["待確認","提醒事項","改動記錄"]:
+            w = find_ws(book, kw)
+            if w: reqs.append(_color_req(w.id, *yellow))
+
+        if reqs:
+            book.batch_update({"requests": reqs})
+            done.append(f"✅ 已隱藏後台頁＋頁籤上色（共 {len(reqs)} 項調整）")
+
+        return "整理完成：\n" + "\n".join(done), 200
+    except Exception as e:
+        return f"error: {str(e)[:200]}", 500
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     sig = request.headers.get("X-Line-Signature","")
