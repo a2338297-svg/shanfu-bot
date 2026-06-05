@@ -134,15 +134,18 @@ def chat_answer(text, memory):
         resp = gemini.models.generate_content(model="gemini-2.0-flash", contents=prompt)
         return resp.text.strip()[:1800]
     except Exception as e:
+        es = str(e)
+        if "429" in es or "quota" in es.lower() or "RESOURCE_EXHAUSTED" in es:
+            head = "💤 今天 AI 對話額度用完了（每天約下午4點重置），聊天功能先暫停。\n但「收資料」仍正常運作，也可用這些指令："
+        else:
+            head = "⚠️ AI 對話暫時連不上，先用這些不靠 AI 的指令："
         return (
-            "我現在不是沒智慧，是 AI 模型呼叫失敗，所以只能跑備用規則。\n"
-            f"錯誤：{str(e)[:120]}\n\n"
-            "可以先用這些不靠 AI 的指令：\n"
-            "• 查陳文賓\n"
+            head + "\n"
+            "• 查〔姓名〕\n"
             "• 缺件\n"
-            "• 九月正風狀況\n"
-            "• 這是九月正風\n"
-            "• 九月正風 陳文賓不吃牛"
+            "• 〔團名〕狀況\n"
+            "• 待確認 ／ 確認〔代碼〕\n"
+            "• 這是〔團名〕（設定目前團別）"
         )
 
 def handle_query(text, book, memory):
