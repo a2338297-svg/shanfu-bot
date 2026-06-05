@@ -14,8 +14,20 @@ from google.genai import types
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
+from collections import deque
 
 app = Flask(__name__)
+
+# ── 去重：記住最近處理過的 LINE message id，擋 webhook 重送 ──
+_seen_ids = deque(maxlen=500)
+def already_processed(msg_id):
+    """若這則 message id 近期處理過就回 True（避免重複寫入）。"""
+    if not msg_id:
+        return False
+    if msg_id in _seen_ids:
+        return True
+    _seen_ids.append(msg_id)
+    return False
 
 LINE_SECRET     = os.environ["LINE_CHANNEL_SECRET"]
 LINE_TOKEN      = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
@@ -183,6 +195,21 @@ def get_or_create_ws(book, title, headers, rows=1000, cols=12):
         ws = book.add_worksheet(title, rows=rows, cols=cols)
         ws.append_row(headers)
         return ws
+
+def log_raw_inbox(book, user_id, text, note=""):
+    """訊息一進來先把原文存進「📥 原始收件」。
+    這是最後防線：不管後面 Gemini 超額、解析失敗、Sheet 寫入出錯，
+    原始資料都不會消失，最多事後人工補。"""
+    try:
+        ws = get_or_create_ws(
+            book,
+            "📥 原始收件",
+            ["時間","使用者ID","原始訊息","後續狀態","備註"],
+            cols=5,
+        )
+        ws.append_row([now_text(), user_id, text, "已收原文", note])
+    except Exception as e:
+        print(f"raw inbox log error: {e}")
 
 def names_text(result):
     names = [p.get("name", "") for p in result.get("passengers", []) if p.get("name")]
@@ -438,9 +465,10 @@ def classify_text(text, memory):
         raw = re.sub(r"^```json\s*|\s*```$", "", raw, flags=re.MULTILINE)
         return normalize_ai_result(text, memory, json.loads(raw))
     except Exception as e:
-        if "429" in str(e) or "quota" in str(e).lower() or "RESOURCE_EXHAUSTED" in str(e):
-            return keyword_classify(text, memory)
-        raise
+        # 任何 Gemini 失敗（超額、JSON 解析錯、網路斷）都改走關鍵字備援，
+        # 不再 re-raise 讓資料石沉大海。最差就是進「待確認」由人工補。
+        print(f"classify_text fallback ({str(e)[:120]}) -> keyword_classify")
+        return keyword_classify(text, memory)
 
 def classify_image(image_b64):
     prompt = """這是旅客傳來的文件圖片。只回傳JSON：
@@ -633,6 +661,8 @@ def webhook():
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text(event):
+    if already_processed(event.message.id):
+        return  # 重複的 webhook 重送，略過不再寫入
     text = event.message.text.strip()
     user_id = event.source.user_id
     if text in ["狀態","status"]:
@@ -674,6 +704,7 @@ def handle_text(event):
         try:
             book = get_sheets()
             memory = get_memory(book, user_id)
+            log_raw_inbox(book, user_id, text)  # 先存原文，最後防線
             if is_query(text):
                 q_result = handle_query(text, book, memory)
                 if q_result:
@@ -694,13 +725,16 @@ def handle_text(event):
 
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image(event):
+    if already_processed(event.message.id):
+        return  # 重複的 webhook 重送，略過不再寫入
     user_id = event.source.user_id
     try:
         with ApiClient(configuration) as api_client:
             img_bytes = MessagingApiBlob(api_client).get_message_content(event.message.id)
         img_b64 = base64.b64encode(img_bytes).decode()
-        ocr = classify_image(img_b64)
         book = get_sheets()
+        log_raw_inbox(book, user_id, f"[圖片] message_id={event.message.id}", "待OCR")
+        ocr = classify_image(img_b64)
         if ocr.get("doc_type") in ["passport","taiwan_permit"]:
             label = "護照" if ocr["doc_type"] == "passport" else "台胞證"
             name = ocr.get("name_zh") or ocr.get("name_en","未知")
