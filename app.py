@@ -978,7 +978,7 @@ def handle_text(event):
     text = event.message.text.strip()
     user_id = event.source.user_id
     if text in ["狀態","status"]:
-        reply = "📊 系統正常運作中\n請貼上旅客資料，Bot 會自動判斷類型和團別。\n\n指令：\n• 記憶 — 查看目前記憶\n• 清除記憶 — 重置上下文\n• 測試Sheet — 測試Google Sheet連線"
+        reply = "📊 系統正常運作中\n請貼上旅客資料，Bot 會自動判斷類型和團別。\n\n指令：\n• 巡守 — 今日預警摘要（缺件/效期/機位期限）\n• 待確認 — 待人工確認清單\n• 記憶 — 查看目前記憶\n• 清除記憶 — 重置上下文\n• 測試Sheet — 測試Google Sheet連線"
     elif text == "測試Sheet":
         try:
             book = get_sheets()
@@ -1011,6 +1011,11 @@ def handle_text(event):
             reply = list_pending(get_sheets())
         except Exception as e:
             reply = f"⚠️ 查詢失敗：{str(e)[:100]}"
+    elif text in ["巡守","今日巡守","巡守摘要","預警"]:
+        try:
+            reply = build_daily_digest(get_sheets())
+        except Exception as e:
+            reply = f"⚠️ 巡守失敗：{str(e)[:100]}"
     elif is_team_setup(text) and not looks_like_data(text):
         team = extract_team_setup(text)
         try:
