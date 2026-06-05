@@ -530,7 +530,16 @@ def append_change(ws, team, person, before, after, impact):
 def append_payment(ws, team, name, d):
     ws.append_row([team, name, d.get("deposit_amount",""), d.get("deposit_date",""), d.get("deposit_method",""), d.get("balance_amount",""), d.get("balance_date",""), d.get("balance_method",""), d.get("last5digits",""), "⏳ 確認中", ""])
 
-def process(result, user_id, book, source_text=""):
+# 關鍵欄位：護照號/身分證/金額。AI 看錯一碼代價太大，一律先進待確認。
+CRITICAL_KEYS = ("passport_no", "id_no", "deposit_amount", "balance_amount")
+def has_critical_field(result):
+    for p in result.get("passengers", []) or []:
+        d = p.get("data", {}) or {}
+        if any(d.get(k) for k in CRITICAL_KEYS):
+            return True
+    return False
+
+def process(result, user_id, book, source_text="", force=False):
     try:
         passengers = result.get("passengers", [])
         team = result.get("team") or "（未指定）"
@@ -542,21 +551,27 @@ def process(result, user_id, book, source_text=""):
         all_changes = []
 
         missing_fields = missing_fields_for_result(result)
-        if rtype == "other" or missing_fields:
-            confirm_id = append_pending_confirmation(book, source_text, result, missing_fields or ["AI無法判斷是否為資料"])
-            append_ai_inbox(book, user_id, source_text, result, rtype != "other", "待確認", "", "缺資料/不明確", True)
+        critical = has_critical_field(result)
+        # force=True 代表已從待確認核准，跳過閘門直接寫入
+        if not force and (rtype == "other" or missing_fields or critical):
+            if missing_fields:
+                reason = missing_fields
+            elif rtype == "other":
+                reason = ["AI無法判斷是否為資料"]
+            else:
+                reason = ["🔴 含關鍵欄位（護照號/身分證/金額），請核對無誤後確認"]
+            confirm_id = append_pending_confirmation(book, source_text, result, reason)
+            append_ai_inbox(book, user_id, source_text, result, rtype != "other", "待確認", "", "、".join(reason), True)
             save_memory(book, user_id, team, f"{rtype}: {summary}")
             lines = [
                 f"⚠️ 這筆我先放到待確認，沒有寫入主表。",
                 f"確認碼：{confirm_id}",
-                f"判斷：{rtype}",
-                f"團別：{team}",
+                f"判斷：{rtype}　團別：{team}",
             ]
             if names_text(result):
                 lines.append(f"人員：{names_text(result)}")
-            lines.append("原因：" + "、".join(missing_fields or ["AI無法判斷是否為資料"]))
-            lines.append("存到：🤖 AI收件紀錄、✅ 待確認")
-            lines.append(f"Sheet：https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit")
+            lines.append("原因：" + "、".join(reason))
+            lines.append(f"👉 核對無誤就回我：確認 {confirm_id}")
             return "\n".join(lines)
 
         if rtype == "passport":
@@ -650,6 +665,48 @@ def process(result, user_id, book, source_text=""):
         return "\n".join(lines)
     except Exception as e:
         return f"⚠️ 寫入錯誤：{str(e)[:100]}"
+
+# ── 閉環確認：把待確認的資料一鍵寫回主表 ──────────────────────
+def list_pending(book):
+    ws = find_ws(book, "待確認")
+    if not ws:
+        return "目前沒有待確認分頁。"
+    open_items = []
+    for row in ws.get_all_values()[1:]:
+        if len(row) < 5 or not row[0]:
+            continue
+        if len(row) > 8 and "已確認" in str(row[8]):
+            continue
+        open_items.append(f"• {row[0]}｜{row[2]} {row[3]}｜{row[4]}")
+    if not open_items:
+        return "✅ 沒有待確認項目。"
+    return f"📋 待確認（{len(open_items)}）回覆「確認 代碼」即寫入：\n" + "\n".join(open_items[:20])
+
+def handle_confirm(text, user_id, book):
+    m = re.search(r"(C\d{6,})", text)
+    if not m:
+        return "請附確認碼，例如：確認 C0605120030\n（用「待確認」可列清單）"
+    cid = m.group(1)
+    ws = find_ws(book, "待確認")
+    if not ws:
+        return "找不到待確認分頁。"
+    for i, row in enumerate(ws.get_all_values(), start=1):
+        if row and str(row[0]).strip() == cid:
+            if len(row) > 8 and "已確認" in str(row[8]):
+                return f"⚠️ {cid} 先前已確認過了，未重複寫入。"
+            try:
+                result = json.loads(row[6]) if len(row) > 6 and row[6] else {}
+            except Exception:
+                result = {}
+            if not result or not result.get("passengers"):
+                return f"⚠️ {cid} 沒有可寫入的解析結果，請到 Sheet 手動處理。"
+            src = row[5] if len(row) > 5 else ""
+            reply = process(result, user_id, book, src, force=True)  # 跳過閘門寫入
+            ws.update_cell(i, 9, "✅ 已確認")
+            ws.update_cell(i, 10, str(user_id)[:8])
+            ws.update_cell(i, 11, now_text())
+            return f"✅ 已確認並寫入（{cid}）\n\n{reply}"
+    return f"❌ 找不到確認碼 {cid}，可用「待確認」查清單。"
 
 # ════════════════════════════════════════════════════════════
 #  主動巡守（agent 的靈魂）：每天掃一次，自己預警，不等人問
@@ -803,6 +860,16 @@ def handle_text(event):
             save_memory(get_sheets(), user_id, "", "")
             reply = "🗑️ 記憶已清除"
         except: reply = "⚠️ 清除失敗"
+    elif text.startswith("確認") and re.search(r"C\d{6,}", text):
+        try:
+            reply = handle_confirm(text, user_id, get_sheets())
+        except Exception as e:
+            reply = f"⚠️ 確認失敗：{str(e)[:100]}"
+    elif text in ["待確認","確認清單","待辦確認"]:
+        try:
+            reply = list_pending(get_sheets())
+        except Exception as e:
+            reply = f"⚠️ 查詢失敗：{str(e)[:100]}"
     elif is_team_setup(text) and not looks_like_data(text):
         team = extract_team_setup(text)
         try:
@@ -854,13 +921,27 @@ def handle_image(event):
             name = ocr.get("name_zh") or ocr.get("name_en","未知")
             memory = get_memory(book, user_id)
             team = memory.get("team","")
-            ws = book.worksheet("👥 旅客總表")
-            try: ws_change = book.worksheet("✏️ 改動記錄")
-            except: ws_change = None
-            _, changes = update_passenger(ws, ws_change, name, team, {"passport_no":ocr.get("doc_no",""),"expiry":ocr.get("expiry",""),"birthday":ocr.get("birthday",""),"id_no":ocr.get("id_no",""),"name_en":ocr.get("name_en",""),"passport_status":"✅ 已交"})
-            save_memory(book, user_id, team, f"剛收了{name}的{label}")
-            reply = f"✅ {label}辨識完成\n\n姓名：{ocr.get('name_zh','')} {ocr.get('name_en','')}\n號碼：{ocr.get('doc_no','')}\n效期：{ocr.get('expiry','')}\n生日：{ocr.get('birthday','')}\n\n已更新至旅客總表 ✅"
-            if changes: reply += "\n\n🔄 偵測到改動：\n" + "\n".join(changes)
+            result = {
+                "type": "passport",
+                "team": team,
+                "passengers": [{"name": name, "data": {
+                    "passport_no": ocr.get("doc_no",""),
+                    "expiry": ocr.get("expiry",""),
+                    "birthday": ocr.get("birthday",""),
+                    "id_no": ocr.get("id_no",""),
+                    "name_en": ocr.get("name_en",""),
+                }}],
+                "summary": f"{label} OCR辨識：{name}",
+                "confidence": ocr.get("confidence","medium"),
+            }
+            save_memory(book, user_id, team, f"剛收了{name}的{label}（待確認）")
+            # OCR 易看錯一碼，含護照號 → 走確認閘門，不直接寫主表
+            gate_reply = process(result, user_id, book, f"[圖片OCR] {label} {name}", force=False)
+            reply = (f"📄 {label}辨識（OCR，請核對數字）\n"
+                     f"姓名：{ocr.get('name_zh','')} {ocr.get('name_en','')}\n"
+                     f"號碼：{ocr.get('doc_no','')}\n"
+                     f"效期：{ocr.get('expiry','')}\n"
+                     f"生日：{ocr.get('birthday','')}\n\n{gate_reply}")
             if ocr.get("expiry"):
                 from datetime import date
                 try:
