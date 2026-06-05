@@ -4,7 +4,7 @@ from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi, MessagingApiBlob,
-    ReplyMessageRequest, TextMessage
+    ReplyMessageRequest, PushMessageRequest, TextMessage
 )
 from linebot.v3.webhooks import (
     MessageEvent, TextMessageContent, ImageMessageContent
@@ -650,6 +650,119 @@ def process(result, user_id, book, source_text=""):
         return "\n".join(lines)
     except Exception as e:
         return f"⚠️ 寫入錯誤：{str(e)[:100]}"
+
+# ════════════════════════════════════════════════════════════
+#  主動巡守（agent 的靈魂）：每天掃一次，自己預警，不等人問
+# ════════════════════════════════════════════════════════════
+import calendar as _calendar
+
+def parse_date_any(s):
+    """盡量把各種日期字串轉成 date；失敗回 None。"""
+    s = str(s or "").strip()
+    if not s:
+        return None
+    s = s.replace(".", "/").replace("-", "/").replace("年", "/").replace("月", "/").replace("日", "")
+    s = re.sub(r"/+", "/", s).strip("/")
+    parts = s.split("/")
+    try:
+        if len(parts) >= 3:
+            return datetime(int(parts[0]), int(parts[1]), int(parts[2])).date()
+        if len(parts) == 2:
+            return datetime(int(parts[0]), int(parts[1]), 1).date()
+    except Exception:
+        return None
+    return None
+
+def add_months(d, n):
+    m = d.month - 1 + n
+    y = d.year + m // 12
+    m = m % 12 + 1
+    day = min(d.day, _calendar.monthrange(y, m)[1])
+    return d.replace(year=y, month=m, day=day)
+
+def find_ws(book, keyword):
+    """用關鍵字模糊找分頁，避免 emoji/空格差異對不上。"""
+    for ws in book.worksheets():
+        if keyword in ws.title:
+            return ws
+    return None
+
+def build_daily_digest(book):
+    """掃旅客總表，產出今日預警摘要文字。"""
+    from datetime import date
+    today = date.today()
+    ov = find_ws(book, "案件總覽")
+    team_dates = {}
+    if ov:
+        for row in ov.get_all_values()[2:]:
+            t = (row[0] if len(row) > 0 else "").strip()
+            if not t:
+                continue
+            team_dates[t] = {
+                "depart": parse_date_any(row[2] if len(row) > 2 else ""),
+                "return": parse_date_any(row[3] if len(row) > 3 else ""),
+            }
+    pax = find_ws(book, "旅客總表")
+    urgent, expiry_alerts = [], []
+    if pax:
+        for row in pax.get_all_values()[2:]:
+            name = (row[2] if len(row) > 2 else "").strip()
+            if not name or "測試" in name:
+                continue
+            team = (row[0] if len(row) > 0 else "").strip()
+            dates = team_dates.get(team, {})
+            depart, ret = dates.get("depart"), dates.get("return")
+            exp = parse_date_any(row[6] if len(row) > 6 else "")
+            pstat = str(row[7] if len(row) > 7 else "")
+            bal = str(row[15] if len(row) > 15 else "")
+            # 1) 護照效期不足回程+6個月
+            if exp and ret and exp < add_months(ret, 6):
+                expiry_alerts.append(f"• {name}（{team}）效期 {row[6]}")
+            # 2) 出發前14天仍缺件
+            if depart:
+                days = (depart - today).days
+                if 0 <= days <= 14:
+                    issues = []
+                    if "✅" not in pstat:
+                        issues.append("護照未齊")
+                    if "✅" not in bal:
+                        issues.append("尾款未結")
+                    if issues:
+                        urgent.append(f"• {name}（{team}，剩{days}天）：{'、'.join(issues)}")
+    lines = [f"🗓️ 山富團務每日巡守 {today.strftime('%Y/%m/%d')}", ""]
+    if urgent:
+        lines.append(f"🔴 出發前14天缺件（{len(urgent)}人）")
+        lines.extend(urgent[:20])
+        lines.append("")
+    if expiry_alerts:
+        lines.append(f"⚠️ 護照效期不足回程+6個月（{len(expiry_alerts)}人）")
+        lines.extend(expiry_alerts[:20])
+        lines.append("")
+    if not urgent and not expiry_alerts:
+        lines.append("✅ 今日無緊急預警，將出團資料皆齊全。")
+    return "\n".join(lines).strip()
+
+DEFAULT_OWNER = "Ua14134c9ba22c6f73b02afc78091f965"
+
+@app.route("/cron/daily", methods=["GET", "POST"])
+def cron_daily():
+    """每日巡守端點。外部 cron 每天打一次即可。
+    可選用 ?key=... 搭配環境變數 CRON_KEY 防止被亂打。"""
+    expected = os.environ.get("CRON_KEY", "")
+    if expected and request.args.get("key", "") != expected:
+        abort(403)
+    try:
+        book = get_sheets()
+        digest = build_daily_digest(book)
+        owner = os.environ.get("OWNER_USER_ID", "").strip() or DEFAULT_OWNER
+        if owner and digest:
+            with ApiClient(configuration) as api_client:
+                MessagingApi(api_client).push_message(
+                    PushMessageRequest(to=owner, messages=[TextMessage(text=digest)])
+                )
+        return digest or "（今日無預警）", 200
+    except Exception as e:
+        return f"error: {str(e)[:200]}", 500
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
