@@ -320,21 +320,49 @@ def append_reminder(book, team, person, task, source_text, priority="中"):
     )
     ws.append_row([now_text(), team, person, task, source_text, "今日", priority, "待處理", "", ""])
 
-CLASSIFY_PROMPT = """你是山富旅遊的業務助理。
-業務會把從LINE或Email收到的旅客資訊貼給你，請分析並回傳JSON。
-分類：passport/payment/dietary/room/change/flight/missing/other
-只回傳JSON：
+CLASSIFY_PROMPT = """你是山富旅遊的資深業務助理，負責把業務貼來的旅客訊息結構化成 JSON。
+
+【硬性規則，違反就是錯】
+1. 只輸出 JSON 一個物件，不要任何說明、開場白、結尾、markdown 標記、```。
+2. 「團別(team)」＝出團/訂單名稱（例：正風團、龐家團、6/15日本團），通常以「團/隊/梯/團體/公司」結尾，或含日期地點。團別【絕對不是】某個人的名字。
+3. 「姓名(name)」＝單一旅客本人（例：黃文童、王小明）。姓名【絕對不能】放進 team；欄位標籤（護照、房型、餐食、訂金…）也【絕對不是】姓名，不要當人名抓。
+4. 一則訊息可含多位旅客，全部列進 passengers。
+5. 只填訊息有提到的資料，沒提到的欄位不要捏造。團別沒提到但記憶有就用記憶的，都沒有就填 null。
+6. confidence：資料明確完整填 "high"；有推測或缺關鍵欄位填 "medium"；很模糊/看不懂填 "low"。
+
+分類 type 只能是：passport / payment / dietary / room / change / flight / missing / other
+
+只回傳這個結構：
 {
   "type": "分類",
-  "team": "團別（如沒提到但記憶有，用記憶的；都沒有填null）",
-  "passengers": [{"name": "姓名", "data": {"欄位": "值"}}],
+  "team": "團別或null",
+  "passengers": [{"name": "旅客姓名", "data": {"欄位": "值"}}],
+  "confidence": "high/medium/low",
   "summary": "一行中文摘要",
   "action": "要更新哪個分頁"
 }
-護照欄位：passport_no, expiry, birthday, id_no, name_en
-付款欄位：deposit_amount, deposit_date, deposit_method, balance_amount, last5digits
-餐食欄位：no_beef, no_raw, vegetarian, no_seafood, other_dietary
-改動欄位：before, after, impact"""
+
+欄位名稱固定用這些（不要自創）：
+護照：passport_no, expiry, birthday, id_no, name_en
+付款：deposit_amount, deposit_date, deposit_method, balance_amount, last5digits
+餐食：no_beef, no_raw, vegetarian, no_seafood, other_dietary（前四個是 true/false）
+改動：before, after, impact
+
+【範例，嚴格照這個風格輸出】
+輸入：正風團 黃文童 護照 312345678 效期 2027/08/15
+輸出：{"type":"passport","team":"正風團","passengers":[{"name":"黃文童","data":{"passport_no":"312345678","expiry":"2027/08/15"}}],"confidence":"high","summary":"正風團 黃文童 護照資料","action":"旅客總表"}
+
+輸入：龐家團 王小明 訂金匯款20000 後五碼12345
+輸出：{"type":"payment","team":"龐家團","passengers":[{"name":"王小明","data":{"deposit_amount":"20000","deposit_method":"匯款","last5digits":"12345"}}],"confidence":"high","summary":"龐家團 王小明 訂金20000","action":"付款追蹤"}
+
+輸入：陳美玲不吃牛，李大華吃素
+輸出：{"type":"dietary","team":null,"passengers":[{"name":"陳美玲","data":{"no_beef":true,"no_raw":false,"vegetarian":false,"no_seafood":false,"other_dietary":""}},{"name":"李大華","data":{"no_beef":false,"no_raw":false,"vegetarian":true,"no_seafood":false,"other_dietary":""}}],"confidence":"high","summary":"陳美玲不吃牛、李大華吃素","action":"旅客總表"}
+
+輸入：6/15日本團 黃文童 房型要單人房
+輸出：{"type":"room","team":"6/15日本團","passengers":[{"name":"黃文童","data":{"room_type":"單人房"}}],"confidence":"high","summary":"6/15日本團 黃文童 單人房","action":"旅客總表"}
+
+輸入：正風團 一位JOIN
+輸出：{"type":"change","team":"正風團","passengers":[{"name":"待補姓名_JOIN","data":{"before":"","after":"新增/JOIN","impact":"新增旅客，姓名待補"}}],"confidence":"low","summary":"正風團 新增一位(姓名待補)","action":"改動記錄"}"""
 
 def keyword_classify(text, memory):
     """Gemini 超額時的備用解析。盡量抓團別、姓名與常見欄位，讓系統不中斷。"""
@@ -572,14 +600,17 @@ def process(result, user_id, book, source_text="", force=False):
 
         missing_fields = missing_fields_for_result(result)
         critical = has_critical_field(result)
+        low_conf = str(result.get("confidence", "")).lower() == "low"
         # force=True 代表已從待確認核准，跳過閘門直接寫入
-        if not force and (rtype == "other" or missing_fields or critical):
+        if not force and (rtype == "other" or missing_fields or critical or low_conf):
             if missing_fields:
                 reason = missing_fields
             elif rtype == "other":
                 reason = ["AI無法判斷是否為資料"]
-            else:
+            elif critical:
                 reason = ["🔴 含關鍵欄位（護照號/身分證/金額），請核對無誤後確認"]
+            else:
+                reason = ["🟡 AI信心不足，請人工確認"]
             confirm_id = append_pending_confirmation(book, source_text, result, reason)
             append_ai_inbox(book, user_id, source_text, result, rtype != "other", "待確認", "", "、".join(reason), True)
             save_memory(book, user_id, team, f"{rtype}: {summary}")
@@ -764,6 +795,36 @@ def find_ws(book, keyword):
             return ws
     return None
 
+def scan_m2_deadlines(book, today, horizon=7):
+    """掃 ✈️ 外站資源控管 的回收日/出名單日/開票期限，產出預警行。
+    tab 不存在就回空（優雅降級，不讓整個巡守中斷）。"""
+    ws = find_ws(book, "外站資源控管")
+    if not ws:
+        return []
+    alerts = []
+    for row in ws.get_all_values()[1:]:  # 跳過 1 列表頭
+        def cell(i):
+            return (row[i] if len(row) > i else "").strip()
+        team, rcat, supplier = cell(0), cell(1), cell(2)
+        if not (team or rcat or supplier):
+            continue  # 空白列略過
+        book_status = cell(3)  # 訂位/訂房狀態
+        incomplete = (not book_status) or any(k in book_status for k in ("未", "待", "進行"))
+        tag = "/".join([x for x in (team, rcat) if x]) + (f"·{supplier}" if supplier else "")
+        # 三個關鍵期限：回收日(5)、出名單日(6)、開票期限(7)
+        for col, label in [(5, "回收日"), (6, "出名單日"), (7, "開票期限")]:
+            d = parse_date_any(cell(col))
+            if not d:
+                continue
+            days = (d - today).days
+            if days < 0:
+                alerts.append(f"🔴 {tag}｜{label}已過期{-days}天（{cell(col)}）")
+            elif days <= horizon:
+                mark = "🔴" if days <= 2 else "⚠️"
+                extra = "，且訂位/開票未完成" if (label == "開票期限" and incomplete) else ""
+                alerts.append(f"{mark} {tag}｜{label}剩{days}天（{cell(col)}）{extra}")
+    return alerts
+
 def build_daily_digest(book):
     """掃旅客總表，產出今日預警摘要文字。"""
     from datetime import date
@@ -807,6 +868,7 @@ def build_daily_digest(book):
                         issues.append("尾款未結")
                     if issues:
                         urgent.append(f"• {name}（{team}，剩{days}天）：{'、'.join(issues)}")
+    m2_alerts = scan_m2_deadlines(book, today)
     lines = [f"🗓️ 山富團務每日巡守 {today.strftime('%Y/%m/%d')}", ""]
     if urgent:
         lines.append(f"🔴 出發前14天缺件（{len(urgent)}人）")
@@ -816,7 +878,11 @@ def build_daily_digest(book):
         lines.append(f"⚠️ 護照效期不足回程+6個月（{len(expiry_alerts)}人）")
         lines.extend(expiry_alerts[:20])
         lines.append("")
-    if not urgent and not expiry_alerts:
+    if m2_alerts:
+        lines.append(f"✈️ 外站資源期限（{len(m2_alerts)}筆）")
+        lines.extend(m2_alerts[:25])
+        lines.append("")
+    if not urgent and not expiry_alerts and not m2_alerts:
         lines.append("✅ 今日無緊急預警，將出團資料皆齊全。")
     return "\n".join(lines).strip()
 
