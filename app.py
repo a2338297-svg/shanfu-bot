@@ -529,7 +529,7 @@ def classify_image(image_b64):
     raw = re.sub(r"^```json\s*|\s*```$", "", raw, flags=re.MULTILINE)
     return json.loads(raw)
 
-COL_MAP = {"team":1,"no":2,"name_zh":3,"name_en":4,"group":5,"passport_no":6,"expiry":7,"passport_status":8,"id_no":9,"birthday":10,"room_type":11,"bus":12,"dietary":13,"health":14,"deposit":15,"balance":16,"payment_method":17,"last5digits":18,"flight":19,"materials":20,"note":21}
+COL_MAP = {"team":1,"no":2,"name_zh":3,"name_en":4,"group":5,"passport_no":6,"expiry":7,"passport_status":8,"id_no":9,"birthday":10,"room_type":11,"bus":12,"dietary":13,"health":14,"deposit":15,"balance":16,"payment_method":17,"last5digits":18,"flight":19,"materials":20,"note":21,"twpermit_expiry":22}
 COL_LABELS = {"passport_no":"護照號碼","expiry":"護照效期","passport_status":"護照狀態","id_no":"身分證號","birthday":"生日","room_type":"房型","dietary":"餐食需求","deposit":"訂金","balance":"尾款","payment_method":"付款方式","last5digits":"後五碼","flight":"班機","name_en":"英文姓名"}
 
 def find_or_create_row(ws, name, team):
@@ -841,7 +841,7 @@ def build_daily_digest(book):
                 "return": parse_date_any(row[3] if len(row) > 3 else ""),
             }
     pax = find_ws(book, "旅客總表")
-    urgent, expiry_alerts = [], []
+    urgent, expiry_alerts, twpermit_alerts = [], [], []
     if pax:
         for row in pax.get_all_values()[2:]:
             name = (row[2] if len(row) > 2 else "").strip()
@@ -857,6 +857,12 @@ def build_daily_digest(book):
             departed = bool(depart and depart < today)
             if exp and ret and not departed and exp < add_months(ret, 6):
                 expiry_alerts.append(f"• {name}（{team}）效期 {row[6]}")
+            # 1b) 台胞證效期（V欄，只中國團填；需在回程日前仍有效）
+            tw_exp = parse_date_any(row[21] if len(row) > 21 else "")
+            if tw_exp and not departed:
+                tw_deadline = ret or depart or today
+                if tw_exp < tw_deadline:
+                    twpermit_alerts.append(f"• {name}（{team}）台胞 {row[21]}")
             # 2) 出發前14天仍缺件
             if depart:
                 days = (depart - today).days
@@ -878,11 +884,15 @@ def build_daily_digest(book):
         lines.append(f"⚠️ 護照效期不足回程+6個月（{len(expiry_alerts)}人）")
         lines.extend(expiry_alerts[:20])
         lines.append("")
+    if twpermit_alerts:
+        lines.append(f"🪪 台胞證已過期/效期不足（{len(twpermit_alerts)}人）")
+        lines.extend(twpermit_alerts[:20])
+        lines.append("")
     if m2_alerts:
         lines.append(f"✈️ 外站資源期限（{len(m2_alerts)}筆）")
         lines.extend(m2_alerts[:25])
         lines.append("")
-    if not urgent and not expiry_alerts and not m2_alerts:
+    if not urgent and not expiry_alerts and not twpermit_alerts and not m2_alerts:
         lines.append("✅ 今日無緊急預警，將出團資料皆齊全。")
     return "\n".join(lines).strip()
 
@@ -934,6 +944,21 @@ def admin_setup():
             done.append("✅ 已建立 ✈️ 外站資源控管")
         else:
             done.append("➖ ✈️ 外站資源控管 已存在")
+
+        # 1b) 旅客總表加「台胞證效期」表頭（V欄＝第22欄；只中國團填）
+        pax = find_ws(book, "旅客總表")
+        if pax:
+            hdr_row = 2
+            for ri in range(1, 4):
+                vals = pax.row_values(ri)
+                if any(("姓名" in str(v)) or ("團別" in str(v)) for v in vals):
+                    hdr_row = ri
+                    break
+            if str(pax.cell(hdr_row, 22).value or "").strip() != "台胞證效期":
+                pax.update_cell(hdr_row, 22, "台胞證效期")
+                done.append(f"✅ 旅客總表 V欄表頭設為「台胞證效期」（第{hdr_row}列）")
+            else:
+                done.append("➖ 旅客總表 V欄表頭已是「台胞證效期」")
 
         reqs = []
         # 2) 隱藏 4 個後台頁
